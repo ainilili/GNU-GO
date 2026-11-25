@@ -1,0 +1,503 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>围棋</title>
+  <style>
+    :root {
+      --ink: #1c1915;
+      --muted: #6b6258;
+      --line: #e4d8c8;
+      --paper: #f6f1e8;
+      --panel: #fffdf8;
+      --accent: #9a3412;
+      --good: #1f6b4a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font: 15px/1.55 "Iowan Old Style", "Palatino Linotype", Palatino, "Songti SC", serif;
+      color: var(--ink);
+      background: var(--paper);
+    }
+    .app {
+      display: grid;
+      grid-template-columns: minmax(280px, 640px) minmax(280px, 420px);
+      gap: 28px;
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 24px 20px 48px;
+    }
+    canvas {
+      width: 100%;
+      height: auto;
+      background: #e7c789;
+      border-radius: 8px;
+      box-shadow: 0 10px 30px rgba(60, 40, 10, 0.12);
+      touch-action: manipulation;
+    }
+    aside { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px 18px 22px; }
+    .eyebrow { margin: 0; letter-spacing: 0.08em; color: var(--accent); font-size: 12px; }
+    h1 { margin: 4px 0 8px; font-size: 28px; font-weight: 600; }
+    h2 { margin: 18px 0 8px; font-size: 16px; }
+    .sub, .note { color: var(--muted); margin: 0 0 12px; }
+    .status { font-weight: 600; min-height: 1.5em; }
+    dl { display: grid; grid-template-columns: 4.5em 1fr; gap: 4px 8px; margin: 10px 0; }
+    dt { color: var(--muted); }
+    dd { margin: 0; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0 12px; }
+    button {
+      font: inherit;
+      border: 1px solid var(--line);
+      background: #fff;
+      border-radius: 8px;
+      padding: 6px 12px;
+      cursor: pointer;
+    }
+    button.on { background: var(--ink); color: #fff; border-color: var(--ink); }
+    button:disabled { opacity: 0.45; cursor: default; }
+    label.slider { display: block; color: var(--muted); margin: 8px 0; }
+    ol { margin: 0; padding-left: 1.2em; }
+    li { margin: 2px 0; }
+    li.pick { color: var(--good); font-weight: 600; }
+    table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    th, td { text-align: left; padding: 3px 4px; border-bottom: 1px solid var(--line); }
+    th { color: var(--muted); font-weight: 500; }
+    .lesson { background: #f3ecdf; border-radius: 8px; padding: 10px 12px; }
+    .lesson p { margin: 0 0 8px; }
+    .lesson p:last-child { margin: 0; }
+    @media (max-width: 800px) {
+      .app { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <canvas id="board" width="640" height="640" aria-label="棋盘"></canvas>
+    <aside>
+      <p class="eyebrow" id="eyebrow">第 1 步</p>
+      <h1 id="title">平坦蒙特卡洛</h1>
+      <p class="sub" id="blurb">每个合法点单独下完若干盘随机棋。胜率最高的点落下。没有 UCT，没有 RAVE，没有棋形。</p>
+      <p id="status" class="status">准备对局</p>
+      <dl>
+        <dt>提子</dt><dd id="caps">黑 0 · 白 0</dd>
+        <dt>贴目</dt><dd>7.5</dd>
+        <dt>本步</dt><dd id="search">还没搜索</dd>
+      </dl>
+      <div class="row" id="colors">
+        <button type="button" data-color="B" class="on">我执黑</button>
+        <button type="button" data-color="W">我执白</button>
+      </div>
+      <div class="row" id="algos">
+        <button type="button" data-algo="flat" class="on">平坦蒙特卡洛</button>
+        <button type="button" data-algo="tree">搜索树</button>
+        <button type="button" data-algo="rave">UCT+RAVE</button>
+      </div>
+      <div class="row" id="opponents">
+        <button type="button" data-opponent="human" class="on">我来下</button>
+        <button type="button" data-opponent="gnugo">对 GNU Go</button>
+      </div>
+      <p class="note" id="opponentNote" hidden>选中的算法执上面的颜色，对方是 GNU Go 的 9 路引擎，等级 10，贴 7.5。终局仍用这边的中国规则数子。</p>
+      <label class="slider"><span id="perLabel">每个候选的随机局数</span> <output id="perOut">8</output>
+        <input id="per" type="range" min="1" max="12" value="8">
+      </label>
+      <div class="row">
+        <button type="button" id="pass">停一手</button>
+        <button type="button" id="undo">悔棋</button>
+        <button type="button" id="new">新对局</button>
+      </div>
+      <h2>这一步的账</h2>
+      <p class="note" id="ledger">行棋方的胜局 / 随机局。第一行就是落下的那手。</p>
+      <table>
+        <thead><tr><th>点</th><th>胜</th><th>局</th><th>胜率</th><th>RAVE</th></tr></thead>
+        <tbody id="rows"><tr><td colspan="5">空棋盘，点一下。</td></tr></tbody>
+      </table>
+      <h2>这一步在做什么</h2>
+      <div class="lesson" id="lesson"></div>
+    </aside>
+  </div>
+  <script>
+    const cols = "ABCDEFGHJ";
+    const canvas = document.getElementById("board");
+    const ctx = canvas.getContext("2d");
+    const statusEl = document.getElementById("status");
+    const capsEl = document.getElementById("caps");
+    const searchEl = document.getElementById("search");
+    const rowsEl = document.getElementById("rows");
+    const perInput = document.getElementById("per");
+    const perOut = document.getElementById("perOut");
+
+    let moves = [];
+    let state = null;
+    let human = "B";
+    let algo = "flat";
+    let opponent = "human";
+    let busy = false;
+    let stopMatch = false;
+    let gnugoResigned = false;
+    let gnugoLoading = null;
+    const gnugoPage = new URL("gnugo/", location.href).href;
+
+    const algoText = {
+      flat: {
+        eyebrow: "第 1 步",
+        title: "平坦蒙特卡洛",
+        blurb: "每个合法点单独下完若干盘随机棋。胜率最高的点落下。",
+        per: "每个候选的随机局数",
+        ledger: "按胜率选。第一行就是落下的那手。",
+        lesson: "<p>每个合法点各自从根局面下完若干盘。这一手是指定的，后面双方均匀随机下到终局。</p><p>没有树。下完的局面丢掉，下一盘还是从根上的每一个点重新开始。</p><p>胜率最高的点落下。盘数一样时，胜的局更多的优先。</p>"
+      },
+      tree: {
+        eyebrow: "第 2 步",
+        title: "搜索树",
+        blurb: "下过的局面留下来。每盘只新展开一个点。最后下访问次数最多的点。",
+        per: "每个候选大约几盘",
+        ledger: "按访问次数选，不是按胜率。第一行就是落下的那手。",
+        lesson: "<p>每一盘从根出发。这个局面还有没试过的合法点，就只展开一个，然后随机下完。</p><p>合法点都已经在树上，就走进胜率最高的那个子节点，下一盘可以从这里接着走。</p><p>胜负写回整条路径。最后比较访问次数。次数相同再看胜率。</p><p>随机终局和平坦蒙特卡洛一样。没有 UCT，没有 RAVE。</p>"
+      },
+      rave: {
+        eyebrow: "第 3 步",
+        title: "UCT+RAVE",
+        blurb: "选点用 UCT 和 RAVE。随机终局不再均匀抽点，按一张 3×3 棋形表加权。",
+        per: "大约每个候选几盘",
+        ledger: "按访问次数选。UCT 让少下过的点还被看到。RAVE 是同一点在后手的胜率。",
+        lesson: "<p>已展开的子节点和还没试过的点放在一起比。每一盘最多新展开一个点，然后按棋形下完。不同次序落到同一盘棋时，共用这一盘的胜负。</p><p>分数先把 RAVE 混进胜率：(1-β)Q + β Q<sub>AMAF</sub>。β = sqrt(k/(3n+k))，k = 1000。再加 UCT：c * sqrt(ln(N+1)/(n+1))，c = 0.1。最后仍下访问次数最多的点。</p><p>终局用 GNU Go 的 3×3 棋形表抽样。能提子、能逃打吃的权重大，真眼权重是 0。对不上的点权重是 1。</p>"
+      }
+    };
+    function showAlgo() {
+      const text = algoText[algo];
+      document.getElementById("eyebrow").textContent = text.eyebrow;
+      document.getElementById("title").textContent = text.title;
+      document.getElementById("blurb").textContent = text.blurb;
+      document.getElementById("perLabel").textContent = text.per;
+      document.getElementById("lesson").innerHTML = text.lesson + "<p>终局用中国规则数子，贴 7.5 目。轮到的一方没有可下的点，当场数子定输赢，不停一手。双方各停一次也会收棋。同一方第二次主动停手，直接判负。上面的算法可以随时换，下一手电脑用新的。</p>";
+      const shown = (state && state.analysis && state.analysis.algo) || algo;
+      document.getElementById("ledger").textContent = algoText[shown].ledger;
+    }
+
+    perInput.addEventListener("input", () => { perOut.textContent = perInput.value; });
+    document.getElementById("algos").addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button");
+      if (!btn || busy) return;
+      algo = btn.dataset.algo;
+      for (const b of ev.currentTarget.querySelectorAll("button")) b.classList.toggle("on", b === btn);
+      showAlgo();
+    });
+    document.getElementById("opponents").addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button");
+      if (!btn || busy) return;
+      opponent = btn.dataset.opponent;
+      for (const b of ev.currentTarget.querySelectorAll("button")) b.classList.toggle("on", b === btn);
+      document.getElementById("opponentNote").hidden = opponent !== "gnugo";
+      document.getElementById("pass").disabled = opponent === "gnugo";
+      if (opponent === "gnugo" && state && !state.ended) runMatch();
+    });
+    document.getElementById("colors").addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button");
+      if (!btn || busy || !state || moves.length) return;
+      human = btn.dataset.color;
+      for (const b of ev.currentTarget.querySelectorAll("button")) b.classList.toggle("on", b === btn);
+      if (opponent === "gnugo") runMatch();
+      else if (human === "W") think();
+    });
+    document.getElementById("pass").onclick = () => { if (opponent === "human") play({ pass: true }); };
+    document.getElementById("undo").onclick = () => {
+      if (busy || !moves.length) return;
+      // 人机对局退到人可以下的局面。对 GNU Go 只退一手，然后双方接着下。
+      moves.pop();
+      if (opponent === "human" && moves.length && sideToMove() !== human) moves.pop();
+      gnugoResigned = false;
+      refresh().then(() => { if (opponent === "gnugo" && state && !state.ended) runMatch(); })
+        .catch((err) => { statusEl.textContent = err.message; });
+    };
+    document.getElementById("new").onclick = () => {
+      if (busy) {
+        stopMatch = true;
+        statusEl.textContent = "这一手结束后重开";
+        return;
+      }
+      startNew();
+    };
+    canvas.addEventListener("click", (ev) => {
+      if (opponent === "gnugo" || busy || !state || state.ended || sideToMove() !== human) return;
+      const rect = canvas.getBoundingClientRect();
+      const x = Math.round((ev.clientX - rect.left) * canvas.width / rect.width);
+      const y = Math.round((ev.clientY - rect.top) * canvas.height / rect.height);
+      const hit = nearest(x, y);
+      if (!hit) return;
+      if (!state.legal.some((p) => p.x === hit.x && p.y === hit.y)) {
+        statusEl.textContent = "这里不能下";
+        return;
+      }
+      play(hit);
+    });
+
+    // sideToMove 按已有手数推出该谁下。空棋盘是黑。
+    function sideToMove() {
+      let s = "B";
+      for (const m of moves) s = s === "B" ? "W" : "B";
+      return s;
+    }
+    // pad 是棋盘线离画布边缘的空白。gap 是相邻两条线的距离。
+    function pad() { return 36; }
+    function gap() { return (canvas.width - pad() * 2) / 8; }
+    // nearest 把点击位置收成最近的交叉点。离交叉点太远就不当落子。
+    function nearest(px, py) {
+      const g = gap();
+      const x = Math.round((px - pad()) / g);
+      const y = Math.round((py - pad()) / g);
+      if (x < 0 || y < 0 || x > 8 || y > 8) return null;
+      const cx = pad() + x * g;
+      const cy = pad() + y * g;
+      if ((px - cx) ** 2 + (py - cy) ** 2 > (g * 0.45) ** 2) return null;
+      return { x, y };
+    }
+    // label 把坐标写成棋谱名字。列名跳过 I，行号从下往上数。
+    function label(x, y) { return cols[x] + (9 - y); }
+
+    // post 把当前完整着手列表发给接口。extra 可以盖掉默认字段。失败时抛出服务返回的中文。
+    async function post(url, extra) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ size: 9, algo, perMove: Number(perInput.value), thinkMs: 3000, moves, ...extra }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "请求失败");
+      return data;
+    }
+    // refresh 只问局面，不让电脑思考。没有搜索结果时把右侧的表清掉。
+    async function refresh() {
+      state = await post("/api/state");
+      paint();
+      statusEl.textContent = outcomeText();
+      capsEl.textContent = "黑 " + state.captures[0] + " · 白 " + state.captures[1];
+      showAlgo();
+      if (!state.analysis) {
+        searchEl.textContent = "还没搜索";
+        fillTable(null);
+      }
+    }
+    // outcomeText 写当前该谁下，或者终局结果。同一方第二次停手单独写判负。
+    function outcomeText() {
+      if (state.resigned && state.score) {
+        const loser = state.score.winner === "B" ? "白棋" : "黑棋";
+        return loser + "再次停手，判负";
+      }
+      const who = state.ended ? "终局" : (state.toMove === "B" ? "黑走" : "白走");
+      if (state.score) {
+        const w = state.score.winner === "B" ? "黑胜" : state.score.winner === "W" ? "白胜" : "和";
+        return who + " · " + w + " " + state.score.margin + " 目";
+      }
+      return who;
+    }
+    // play 先记下人的这一手。还没终局且轮到电脑时，再请求电脑应一手。
+    async function play(move) {
+      if (busy || (state && state.ended)) return;
+      moves.push(move.pass ? { pass: true } : { x: move.x, y: move.y });
+      await refresh();
+      if (!state.ended && sideToMove() !== human) await think();
+    }
+    function startNew() {
+      stopMatch = false;
+      gnugoResigned = false;
+      moves = [];
+      refresh().then(() => {
+        if (opponent === "gnugo") runMatch();
+        else if (human === "W") think();
+      }).catch((err) => { statusEl.textContent = err.message; });
+    }
+    // think 请求这边的算法落子。响应里的棋盘已经包含这手，这里再把同一手补进 moves。
+    async function think() {
+      if (busy) return;
+      busy = true;
+      try {
+        await thinkMove();
+      } catch (err) {
+        statusEl.textContent = err.message;
+      } finally {
+        busy = false;
+      }
+    }
+    async function thinkMove() {
+      statusEl.textContent = "每个候选各下 " + perInput.value + " 盘随机棋…";
+      state = await post("/api/think");
+      const played = state.analysis;
+      if (played && played.pass) moves.push({ pass: true });
+      else if (played && played.move) moves.push({ x: played.move.x, y: played.move.y });
+      paint();
+      fillTable(played);
+      const name = !played && state.ended ? "没有可下的点，已数子" : played && played.pass ? "停一手" : played && played.move ? label(played.move.x, played.move.y) : "—";
+      const wr = played ? Math.round(played.winRate * 100) : 0;
+      searchEl.textContent = name + " · " + (played ? played.games : 0) + " 盘 · 胜率 " + wr + "% · " + (played ? played.millis : 0) + " ms";
+      statusEl.textContent = outcomeText();
+      showAlgo();
+      capsEl.textContent = "黑 " + state.captures[0] + " · 白 " + state.captures[1];
+    }
+    // loadGnuGo 载入本站的 GNU Go 引擎。文件来自对方仓库的公开页面，放在同站才能启动后台线程。
+    function loadGnuGo() {
+      if (!gnugoLoading) {
+        gnugoLoading = import(gnugoPage + "gnugo.js").then(({ GnuGo }) => GnuGo.create({
+          workerUrl: gnugoPage + "gnugo-worker.js",
+        })).catch((err) => {
+          gnugoLoading = null;
+          throw new Error("GNU Go 引擎没有载入：" + (err && err.message ? err.message : err));
+        });
+      }
+      return gnugoLoading;
+    }
+    // parseVertex 把 GNU Go 的坐标翻成这边的 x、y。行号从下往上数。
+    function parseVertex(text) {
+      const v = String(text || "").trim().toUpperCase();
+      if (v === "PASS") return { pass: true };
+      if (v === "RESIGN") return { resign: true };
+      const x = cols.indexOf(v[0]);
+      const row = Number(v.slice(1));
+      const y = 9 - row;
+      if (x < 0 || row < 1 || row > 9) throw new Error("GNU Go 返回了无法识别的点：" + text);
+      return { x, y };
+    }
+    // gnugoTurn 把当前着手重放给 GNU Go，再要它下一手。
+    async function gnugoTurn() {
+      statusEl.textContent = gnugoLoading ? "GNU Go 思考…" : "正在载入 GNU Go…";
+      const go = await loadGnuGo();
+      statusEl.textContent = "GNU Go 思考…";
+      await go.boardsize(9);
+      await go.komi(7.5);
+      await go.level(10);
+      let color = "black";
+      for (const m of moves) {
+        await go.play(color, m.pass ? "pass" : label(m.x, m.y));
+        color = color === "black" ? "white" : "black";
+      }
+      const reply = parseVertex(await go.genmove(color));
+      if (reply.resign) {
+        gnugoResigned = true;
+        searchEl.textContent = "GNU Go 认输";
+        rowsEl.innerHTML = "<tr><td colspan='5'>GNU Go 认输</td></tr>";
+        statusEl.textContent = "GNU Go 认输";
+        return;
+      }
+      moves.push(reply.pass ? { pass: true } : { x: reply.x, y: reply.y });
+      state = await post("/api/state");
+      paint();
+      const name = reply.pass ? "停一手" : label(reply.x, reply.y);
+      searchEl.textContent = "GNU Go · " + name;
+      rowsEl.innerHTML = "<tr class='pick'><td colspan='5'>GNU Go 下在 " + name + "</td></tr>";
+      statusEl.textContent = outcomeText();
+      capsEl.textContent = "黑 " + state.captures[0] + " · 白 " + state.captures[1];
+    }
+    // runMatch 让选中的算法和 GNU Go 轮流下，直到终局、认输，或按下新对局。
+    async function runMatch() {
+      if (busy || opponent !== "gnugo" || !state || state.ended) return;
+      busy = true;
+      stopMatch = false;
+      try {
+        while (opponent === "gnugo" && state && !state.ended && !gnugoResigned && !stopMatch) {
+          if (sideToMove() === human) await thinkMove();
+          else await gnugoTurn();
+        }
+      } catch (err) {
+        statusEl.textContent = err.message;
+      } finally {
+        busy = false;
+        if (stopMatch) startNew();
+      }
+    }
+    // fillTable 画胜率表。第一行是实际落下的那手。
+    function fillTable(played) {
+      const top = (played && played.top) || [];
+      if (!top.length) {
+        rowsEl.innerHTML = "<tr><td colspan='5'>没有候选</td></tr>";
+        return;
+      }
+      rowsEl.innerHTML = top.map((m, i) => {
+        const cls = i === 0 ? " class='pick'" : "";
+        const rave = m.raveN ? Math.round((m.rave || 0) * 100) + "%" : "—";
+        return "<tr" + cls + "><td>" + label(m.x, m.y) + "</td><td>" + m.wins + "</td><td>" + m.games + "</td><td>" + Math.round(m.winRate * 100) + "%</td><td>" + rave + "</td></tr>";
+      }).join("");
+    }
+    // paint 画棋盘、星位、候选胜率、棋子，以及最后一颗子中心的标记。
+    // 胜率写在推荐点上。落下的那一手写在棋子内部靠下，其余推荐点写在交叉点上。
+    function paint() {
+      const g = gap();
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#e7c789";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      ctx.strokeStyle = "#3a2a1a";
+      ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      for (let i = 0; i < 9; i++) {
+        const p = pad() + i * g;
+        ctx.moveTo(pad(), p); ctx.lineTo(canvas.width - pad(), p);
+        ctx.moveTo(p, pad()); ctx.lineTo(p, canvas.height - pad());
+      }
+      ctx.stroke();
+      for (const [x, y] of [[2, 2], [6, 2], [4, 4], [2, 6], [6, 6]]) {
+        ctx.beginPath();
+        ctx.arc(pad() + x * g, pad() + y * g, 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = "#3a2a1a";
+        ctx.fill();
+      }
+      ctx.fillStyle = "#5c3b16";
+      ctx.font = "13px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      for (let i = 0; i < 9; i++) {
+        ctx.fillText(cols[i], pad() + i * g, 16);
+        ctx.fillText(String(9 - i), 16, pad() + i * g);
+      }
+      if (!state) return;
+      const top = (state.analysis && state.analysis.top) || [];
+      for (const m of top) {
+        ctx.beginPath();
+        ctx.arc(pad() + m.x * g, pad() + m.y * g, 8 + m.winRate * 10, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(154, 52, 18, " + (0.18 + m.winRate * 0.45) + ")";
+        ctx.fill();
+      }
+      for (let y = 0; y < 9; y++) {
+        for (let x = 0; x < 9; x++) {
+          const c = state.board[y][x];
+          if (!c) continue;
+          const cx = pad() + x * g;
+          const cy = pad() + y * g;
+          ctx.beginPath();
+          ctx.arc(cx, cy, g * 0.42, 0, Math.PI * 2);
+          ctx.fillStyle = c === 1 ? "#1a1a1a" : "#f7f4ee";
+          ctx.fill();
+          ctx.strokeStyle = "#2b2118";
+          ctx.stroke();
+        }
+      }
+      if (state.last) {
+        ctx.beginPath();
+        ctx.arc(pad() + state.last.x * g, pad() + state.last.y * g, 4, 0, Math.PI * 2);
+        ctx.fillStyle = state.board[state.last.y][state.last.x] === 1 ? "#f4efe4" : "#9a3412";
+        ctx.fill();
+      }
+      drawWinRates(g);
+    }
+    // drawWinRates 把搜索表里每个推荐点的胜率写到棋盘上，例如 75%。
+    function drawWinRates(g) {
+      const top = (state.analysis && state.analysis.top) || [];
+      ctx.font = "bold 13px sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.lineWidth = 3;
+      for (const m of top) {
+        const stone = state.board[m.y][m.x];
+        const cx = pad() + m.x * g;
+        const cy = pad() + m.y * g + (stone ? 12 : 0);
+        const text = Math.round(m.winRate * 100) + "%";
+        ctx.strokeStyle = stone === 1 ? "#1a1a1a" : "#f6efe0";
+        ctx.fillStyle = stone === 1 ? "#f3efe6" : "#9a3412";
+        ctx.strokeText(text, cx, cy);
+        ctx.fillText(text, cx, cy);
+      }
+    }
+    showAlgo();
+    refresh().catch((err) => { statusEl.textContent = err.message; });
+  </script>
+</body>
+</html>
