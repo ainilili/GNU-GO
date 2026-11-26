@@ -16,7 +16,9 @@ import (
 // Config 控制每个候选点要下完多少盘随机棋。
 type Config struct {
 	// PerMove 是每个候选希望完成的随机局数。第一轮一定跑完，后面的轮次受到 Think 限制。
+	// Sims 大于 0 时改成总盘数，不再乘以合法点数。页面上的等级用这个。
 	PerMove int
+	Sims    int
 	// Think 是思考时间上限。第一轮不受它限制。
 	Think time.Duration
 	// Seed 是随机数种子。0 表示用当前时间，同一局面每次结果可以不同。
@@ -53,8 +55,12 @@ func (c Config) normalized() Config {
 	if c.Think <= 0 {
 		c.Think = 2 * time.Second
 	}
-	if c.Think > 8*time.Second {
-		c.Think = 8 * time.Second
+	limit := 8 * time.Second
+	if c.Sims > 0 {
+		limit = 3 * time.Minute
+	}
+	if c.Think > limit {
+		c.Think = limit
 	}
 	return c
 }
@@ -96,13 +102,22 @@ func Search(root *engine.Board, cfg Config) Result {
 	wins := make([]int, len(legal))
 	deadline := start.Add(cfg.Think)
 	rounds := 0
-	for round := 0; round < cfg.PerMove; round++ {
-		// 第 0 轮即使已经超时也要跑完，否则有的点一盘都没有，没法比。
-		if round > 0 && time.Now().After(deadline) {
+	// Sims 是总盘数。没设时仍是每个候选 PerMove 盘。
+	budget := cfg.PerMove * len(legal)
+	if cfg.Sims > 0 {
+		budget = cfg.Sims
+	}
+	played := 0
+	for played < budget {
+		// 每个候选先各有一盘，即使已经超时也要跑完，否则有的点没法比。
+		if played >= len(legal) && time.Now().After(deadline) {
 			break
 		}
 		rounds++
 		for i, pt := range legal {
+			if played >= budget {
+				break
+			}
 			b := root.Clone() // 每次都从根复制，不从上一盘的半路继续
 			s.ClearSaved()
 			if _, ok := b.Play(pt, s); !ok {
@@ -114,6 +129,7 @@ func Search(root *engine.Board, cfg Config) Result {
 			if (root.Side == engine.Black) == blackWon {
 				wins[i]++
 			}
+			played++
 		}
 	}
 

@@ -99,6 +99,18 @@ func (b *Board) Clone() *Board {
 	return &c
 }
 
+// CloneInto 复制到已有的棋盘上，颜色切片够长就接着用。邻接表仍然共用。
+func (b *Board) CloneInto(dst *Board) *Board {
+	if dst == nil || cap(dst.Color) < b.N {
+		return b.Clone()
+	}
+	colors := dst.Color[:b.N]
+	*dst = *b
+	copy(colors, b.Color)
+	dst.Color = colors
+	return dst
+}
+
 // Index 把界面坐标换成 Color 切片的下标。x 从左往右，y 从棋盘上方往下，都从 0 开始。
 func (b *Board) Index(x, y int) int {
 	return y*b.Size + x
@@ -144,6 +156,14 @@ func NewScratch(n int) *Scratch {
 
 // ClearSaved 丢掉上一盘模拟留下的提子记录。不调用的话，下一次 Play 会把旧提子算进自己的撤销区间。
 func (s *Scratch) ClearSaved() { s.saved = s.saved[:0] }
+
+// Captured 返回这一手提掉的点。切片指向 Scratch 内部，下次落子或退子会变。
+func (s *Scratch) Captured(u Undo) []int32 {
+	if u.CapStart < 0 || u.CapEnd > len(s.saved) || u.CapStart > u.CapEnd {
+		return nil
+	}
+	return s.saved[u.CapStart:u.CapEnd]
+}
 
 // Liberties 返回 pt 所在整块棋的气数。pt 不是棋子时返回 0。
 func (b *Board) Liberties(pt int, s *Scratch) int {
@@ -222,6 +242,20 @@ func (b *Board) groupInfo(start int, s *Scratch) (group []int32, libs int) {
 		}
 	}
 	return s.group, libs
+}
+
+// CopyGroup 把 start 所在的整块棋抄进 dst，并返回气数。start 不是子时返回空。
+// groupInfo 的结果放在 Scratch 里，下一次调用会盖掉，所以要抄出来才能留着用。
+func (b *Board) CopyGroup(start int, s *Scratch, dst []int) ([]int, int) {
+	if start < 0 || start >= b.N || b.Color[start] == Empty {
+		return dst[:0], 0
+	}
+	grp, libs := b.groupInfo(start, s)
+	dst = dst[:0]
+	for _, g := range grp {
+		dst = append(dst, int(g))
+	}
+	return dst, libs
 }
 
 // Undo 记录一次成功落子之前的局面，供 Board.Undo 退回。
@@ -428,21 +462,11 @@ func (b *Board) AtariCapture(pt int, color Color, s *Scratch) int {
 		}
 		grp, libs := b.groupInfo(nb, s)
 		sz := len(grp)
-		lib := -1
 		for _, g := range grp {
-			gp := int(g)
-			s.seen[gp] = st
-			gb := gp * 4
-			gn := int(b.neighN[gp])
-			for k := 0; k < gn; k++ {
-				q := int(b.neigh[gb+k])
-				if b.Color[q] == Empty {
-					lib = q
-				}
-			}
+			s.seen[int(g)] = st
 		}
-		// 气数是 1，且扫描到的那口气就是 pt，才算「下在 pt 能提这块」。
-		if libs == 1 && lib == pt {
+		// 这块棋挨着空点 pt。气数是 1 时，那一口气只能是 pt，下在这里就能提。
+		if libs == 1 {
 			total += sz
 		}
 	}
@@ -564,6 +588,56 @@ func (b *Board) Areas(s *Scratch, owner []Color) (black, white int) {
 func (b *Board) Margin(s *Scratch) float64 {
 	black, white := b.Areas(s, nil)
 	return float64(black-white) - b.Komi
+}
+
+// McWhiteWins 是 GNU Go 蒙特卡洛终局的胜负，只给搜索用。页面上的终局仍走中国规则。
+// 每个点不是白就是黑：棋子算自己的颜色。空点按南、西、北、东找第一颗子，跟那颗子；
+// 四个方向都没有子，算黑。白点数减黑点数，再加贴目，大于 0 白胜。
+func (b *Board) McWhiteWins() bool {
+	return b.McWhiteWinsWith(nil)
+}
+
+// McWhiteWinsWith 和 McWhiteWins 相同。settled 里非空的点直接算给那一方，
+// 不再看棋盘上后来变成什么样。这是开局时无条件活棋留下的账。
+func (b *Board) McWhiteWinsWith(settled []Color) bool {
+	score := 0
+	for y := 0; y < b.Size; y++ {
+		for x := 0; x < b.Size; x++ {
+			i := b.Index(x, y)
+			c := Empty
+			if i < len(settled) {
+				c = settled[i]
+			}
+			if c == Empty {
+				c = b.Color[i]
+			}
+			if c == Empty {
+				c = mcNeighborColor(b, x, y)
+			}
+			if c == White {
+				score++
+			} else {
+				score--
+			}
+		}
+	}
+	return float64(score)+b.Komi > 0
+}
+
+// mcNeighborColor 按 GNU Go delta 的前四格看正交邻居。没有子就当黑。
+func mcNeighborColor(b *Board, x, y int) Color {
+	dirs := [4][2]int{{0, 1}, {-1, 0}, {0, -1}, {1, 0}}
+	for _, d := range dirs {
+		nx, ny := x+d[0], y+d[1]
+		if nx < 0 || ny < 0 || nx >= b.Size || ny >= b.Size {
+			continue
+		}
+		c := b.Color[b.Index(nx, ny)]
+		if c == Black || c == White {
+			return c
+		}
+	}
+	return Black
 }
 
 // String 把棋盘打成文本。黑是 X，白是 O，空点是点。测试用它比较搜索有没有改原棋盘。

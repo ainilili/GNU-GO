@@ -9,6 +9,13 @@ import (
 	"weiqi-step/rollout"
 )
 
+func TestSimsIsTotalNotPerCandidate(t *testing.T) {
+	res := Search(engine.New(9, 7.5), Config{Sims: 5, Think: time.Second, Seed: 1})
+	if res.Rounds != 5 {
+		t.Fatalf("rounds=%d", res.Rounds)
+	}
+}
+
 func TestSearchDoesNotMutateRoot(t *testing.T) {
 	b := engine.New(5, 7.5)
 	before := b.String()
@@ -141,7 +148,7 @@ func TestSamePositionSharesNode(t *testing.T) {
 	s := engine.NewScratch(b.N)
 	rng := rand.New(rand.NewSource(1))
 	root := &node{}
-	root.ensure(b, s, rng)
+	root.ensure(b, s, rng, nil)
 	seen := map[string]*node{}
 	first := follow(t, b, root, seen, s, rng, []int{0, 1, 2})
 	second := follow(t, b, root, seen, s, rng, []int{2, 1, 0})
@@ -176,18 +183,31 @@ func follow(t *testing.T, root *engine.Board, n *node, seen map[string]*node, s 
 	t.Helper()
 	b := root.Clone()
 	for _, pt := range pts {
-		n.ensure(b, s, rng)
+		n.ensure(b, s, rng, nil)
 		if _, ok := b.Play(pt, s); !ok {
 			t.Fatalf("illegal %d", pt)
 		}
 		n.dropUntried(pt)
 		var fresh bool
-		n, fresh = n.attach(b, pt, seen, s, rng)
+		n, fresh = n.attach(b, pt, seen, s, rng, nil)
 		if fresh {
 			continue
 		}
 	}
 	return n
+}
+
+func TestMcWhiteWinsUsesNeighborOrder(t *testing.T) {
+	b := engine.New(3, 0.5)
+	b.Color[b.Index(1, 1)] = engine.White
+	// 中心白子，上下左右的空点跟着它，四个角没有邻子，算黑。白 5、黑 4，差 +1。
+	if !b.McWhiteWins() {
+		t.Fatal("komi 0.5 should be white")
+	}
+	b.Komi = -1.5
+	if b.McWhiteWins() {
+		t.Fatal("komi -1.5 should be black")
+	}
 }
 
 func TestRaveOverridesFewLosses(t *testing.T) {

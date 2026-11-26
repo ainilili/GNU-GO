@@ -21,6 +21,7 @@ import (
 // C、K 传 0 时用上面的缺省值。
 type Config struct {
 	PerMove int
+	Sims    int // 大于 0 时是总盘数，不再乘以合法点数。页面上的等级用这个。
 	Think   time.Duration
 	Seed    int64
 	C       float64
@@ -86,8 +87,12 @@ func (c Config) normalized() Config {
 	if c.Think <= 0 {
 		c.Think = 2 * time.Second
 	}
-	if c.Think > 8*time.Second {
-		c.Think = 8 * time.Second
+	limit := 8 * time.Second
+	if c.Sims > 0 {
+		limit = 3 * time.Minute
+	}
+	if c.Think > limit {
+		c.Think = limit
 	}
 	if c.C <= 0 {
 		c.C = 0.1
@@ -112,32 +117,43 @@ func Search(root *engine.Board, cfg Config) Result {
 	if seed == 0 {
 		seed = time.Now().UnixNano()
 	}
-	rng := rand.New(rand.NewSource(seed))
 	s := engine.NewScratch(root.N)
 	legal := rollout.Legal(root, s)
 	if len(legal) == 0 {
 		out.Elapsed = time.Since(start)
 		return out
 	}
+	budget := cfg.PerMove * len(legal)
+	if cfg.Sims > 0 {
+		budget = cfg.Sims
+	}
+	return runSearch(root, cfg, budget, seed, start)
+}
+
+func runSearch(root *engine.Board, cfg Config, budget int, seed int64, start time.Time) Result {
+	out := Result{Pt: -1, Pass: true}
+	rng := rand.New(rand.NewSource(seed))
+	s := engine.NewScratch(root.N)
 	rootNode := &node{}
-	rootNode.ensure(root, s, rng)
+	settled := engine.Unconditional(root)
+	rootNode.ensure(root, s, rng, settled)
 	// 根不放进表。根的账是整次搜索，不是「又走回开局」这一手的账。
 	// 搜索中第一次走回和根相同的盘面时另建节点，之后再走到才并进去。
 	seen := make(map[string]*node)
-	// 总盘数对齐另外两种算法。UCT 自己决定先展开谁，不强制把每个点都先走一遍。
-	budget := cfg.PerMove * len(legal)
 	deadline := start.Add(cfg.Think)
 	sims := 0
+	var buf simBuf
 	// 每一圈跑一盘，不是在这里随机选点。传入的 root、rootNode、c、k 每次相同：
 	// root 是开局的那盘棋，模拟都从这里重新复制一份再下。
 	// rootNode 是同一棵树。选哪一手由它里面的访问、胜局和 RAVE 决定，simulate 会改这些数。
 	// 所以下一盘看到的分数已经变了。rng 也是同一个，只是内部随机数往前走。
 	// 第一盘即使已经超过 Think 也要跑完，后面的盘才看时间。
+	// buf 里的棋盘和棋形权重反复用，避免每盘都重新分配。
 	for sims < budget {
 		if sims > 0 && time.Now().After(deadline) {
 			break
 		}
-		simulate(root, rootNode, seen, s, rng, cfg.C, cfg.K)
+		simulate(root, rootNode, seen, s, rng, cfg.C, cfg.K, settled, &buf)
 		sims++
 	}
 	if len(rootNode.edges) == 0 {
@@ -151,15 +167,18 @@ func Search(root *engine.Board, cfg Config) Result {
 			best = e
 		}
 	}
-	moves := make([]Stat, len(rootNode.edges))
+	moves := make([]Stat, 0, len(rootNode.edges))
 	total := 0
-	for i, e := range rootNode.edges {
+	for _, e := range rootNode.edges {
+		if e.pt < 0 {
+			continue
+		}
 		wr := 0.0
 		if e.to.visits > 0 {
 			wr = float64(e.to.wins) / float64(e.to.visits)
 		}
 		rn, rw := 0, 0
-		if e.pt >= 0 && e.pt < len(rootNode.raveN) {
+		if e.pt < len(rootNode.raveN) {
 			rn = rootNode.raveN[e.pt]
 			rw = rootNode.raveW[e.pt]
 		}
@@ -167,12 +186,12 @@ func Search(root *engine.Board, cfg Config) Result {
 		if rn > 0 {
 			rv = float64(rw) / float64(rn)
 		}
-		moves[i] = Stat{Pt: e.pt, Games: e.to.visits, Wins: e.to.wins, WinRate: wr, RaveN: rn, RaveW: rw, Rave: rv}
+		moves = append(moves, Stat{Pt: e.pt, Games: e.to.visits, Wins: e.to.wins, WinRate: wr, RaveN: rn, RaveW: rw, Rave: rv})
 		total += e.to.visits
 	}
 	sortByVisits(moves)
 	out.Pt = best.pt
-	out.Pass = false
+	out.Pass = best.pt < 0
 	out.Games = total
 	if best.to.visits > 0 {
 		out.WinRate = float64(best.to.wins) / float64(best.to.visits)
@@ -184,7 +203,7 @@ func Search(root *engine.Board, cfg Config) Result {
 }
 
 // ensure 第一次走进这个局面时列出合法点，并准备 RAVE 表。
-func (n *node) ensure(b *engine.Board, s *engine.Scratch, rng *rand.Rand) {
+func (n *node) ensure(b *engine.Board, s *engine.Scratch, rng *rand.Rand, settled []engine.Color) {
 	if n.inited {
 		return
 	}
@@ -192,6 +211,15 @@ func (n *node) ensure(b *engine.Board, s *engine.Scratch, rng *rand.Rand) {
 	n.raveN = make([]int, b.N)
 	n.raveW = make([]int, b.N)
 	n.untried = rollout.Legal(b, s)
+	if len(settled) == b.N {
+		kept := n.untried[:0]
+		for _, p := range n.untried {
+			if settled[p] == engine.Empty {
+				kept = append(kept, p)
+			}
+		}
+		n.untried = kept
+	}
 	shuffle(rng, n.untried)
 }
 
@@ -207,21 +235,36 @@ func (n *node) ensure(b *engine.Board, s *engine.Scratch, rng *rand.Rand) {
 // 一盘分三段。先沿树向下。走到已经见过的局面就接上那个节点，继续用它的账选点。
 // 真正新建的节点一盘只加一个，然后不再往下长。剩下的棋按棋形权重下完。
 // 最后把胜负写回 path 上的那些节点，供下一盘使用。
-func simulate(root *engine.Board, rootNode *node, seen map[string]*node, s *engine.Scratch, rng *rand.Rand, c, k float64) {
+// simBuf 是一条搜索自己的临时空间。不能分给两条同时在跑的搜索。
+type simBuf struct {
+	board *engine.Board
+	sh    rollout.Shape
+	moves []played
+	near  []int
+}
+
+func simulate(root *engine.Board, rootNode *node, seen map[string]*node, s *engine.Scratch, rng *rand.Rand, c, k float64, settled []engine.Color, buf *simBuf) {
 	// b 是这盘的棋盘副本。rootNode 不复制，后面改的就是外面那棵树。
-	b := root.Clone()
+	b := root.CloneInto(buf.board)
+	buf.board = b
 	s.ClearSaved()
 	n := rootNode
 	path := []*node{n}
-	moves := make([]played, 0, 16)
+	buf.moves = buf.moves[:0]
+	moves := buf.moves
 	last := -1
-	// 第一段：沿已有的树往下走。每一步用当前节点上的账算 UCT+RAVE。
-	// 选中旧边就走到它指向的局面。选中还没试过的点，先看落子后的盘面见没见过。
-	for len(path) < b.N*2 && b.Passes < 2 {
-		n.ensure(b, s, rng)
+	buf.near = nil
+	// 第一段：沿已有的树往下走。停手也是一手，连续停三次才离开树去数子。
+	// 点着按 UCT+RAVE 选。没有可下的点，或者剩下的都是自己的真眼，就停一手。
+	// 无条件活棋的空点不在候选里。
+	for len(path) < b.N*2 && b.Passes < 3 {
+		n.ensure(b, s, rng, settled)
 		pt, to := n.choose(rng, c, k)
 		if to == nil && pt < 0 {
-			break
+			if !descendPass(b, s, &n, &path, &moves, seen, rng, settled, &buf.near) {
+				break
+			}
+			continue
 		}
 		// 自己的真眼不长进树里。从候选里拿掉，这一步重选。终局抽样里它的权重仍是 0。
 		if to == nil && b.ProperSmallEye(pt, b.Side) {
@@ -229,13 +272,23 @@ func simulate(root *engine.Board, rootNode *node, seen map[string]*node, s *engi
 			continue
 		}
 		color := b.Side
-		// 落子落在副本 b 上。root 不动。
+		// 落子落在副本 b 上。root 不动。非法点丢掉再选，不停整盘模拟。
+		// 近处队列要在落子前算。落子失败就丢掉，局面没变。
+		var queued []int
+		if pt >= 0 {
+			queued = rollout.NearQueue(b, pt, s)
+		}
 		if _, ok := b.Play(pt, s); !ok {
+			if to == nil {
+				n.dropUntried(pt)
+				continue
+			}
 			break
 		}
 		moves = append(moves, played{pt: pt, color: color})
 		if pt >= 0 {
 			last = pt
+			buf.near = queued
 		}
 		if to != nil {
 			// 这条边以前就有。局面已经在路径上说明走回了旧盘，本盘不再绕进去。
@@ -248,7 +301,7 @@ func simulate(root *engine.Board, rootNode *node, seen map[string]*node, s *engi
 		}
 		// 这手从当前节点第一次走出。见过的局面直接接上，没见过才新建。
 		n.dropUntried(pt)
-		to, fresh := n.attach(b, pt, seen, s, rng)
+		to, fresh := n.attach(b, pt, seen, s, rng, settled)
 		if nodeOnPath(path, to) {
 			break
 		}
@@ -258,12 +311,14 @@ func simulate(root *engine.Board, rootNode *node, seen map[string]*node, s *engi
 			break
 		}
 	}
-	// 第二段：树不再往下长。后面双方按棋形权重下到终局。
+	// 第二段：树不再往下长。后面双方按棋形权重下到连续停三次。
 	// 这些手只记在 moves 里，不再长出节点。RAVE 会用到它们。
 	limit := b.N * 2
-	for b.Passes < 2 && limit > 0 {
+	buf.sh.Reset()
+	buf.sh.PrimeNear(buf.near)
+	for b.Passes < 3 && limit > 0 {
 		color := b.Side
-		pt, ok := rollout.PlayShape(b, s, rng, last)
+		pt, ok := buf.sh.Play(b, s, rng, last)
 		if !ok {
 			break
 		}
@@ -275,7 +330,30 @@ func simulate(root *engine.Board, rootNode *node, seen map[string]*node, s *engi
 	}
 	// 第三段：用终局谁赢了，去改 path 上每个节点的 visits、wins 和 RAVE。
 	// 改的是 rootNode 以及它的子节点。下一盘 simulate 还是传入这个 rootNode，读到的就是更新后的账。
-	backup(path, moves, root.Side, b.Margin(s) > 0)
+	buf.moves = moves
+	backup(path, moves, root.Side, !b.McWhiteWinsWith(settled))
+}
+
+// descendPass 在树上停一手。停手不跟别的点比分，只在没有点可下时走。
+// 返回 false 表示这盘的树到此为止，调用方接着做终局抽样。
+func descendPass(b *engine.Board, s *engine.Scratch, n **node, path *[]*node, moves *[]played, seen map[string]*node, rng *rand.Rand, settled []engine.Color, near *[]int) bool {
+	color := b.Side
+	if _, ok := b.Play(-1, s); !ok {
+		return false
+	}
+	*near = nil
+	*moves = append(*moves, played{pt: -1, color: color})
+	to := (*n).edgeTo(-1)
+	fresh := false
+	if to == nil {
+		to, fresh = (*n).attach(b, -1, seen, s, rng, settled)
+	}
+	if nodeOnPath(*path, to) {
+		return false
+	}
+	*path = append(*path, to)
+	*n = to
+	return !fresh
 }
 
 // choose 在已有的边和未试过的点里挑分数最高的。
@@ -306,6 +384,9 @@ func (n *node) choose(rng *rand.Rand, c, k float64) (int, *node) {
 	// 别的路径若走到同一盘棋，加进去的也是这本账。
 	// RAVE 记在当前节点上，用这一手的点号去查。
 	for _, e := range n.edges {
+		if e.pt < 0 {
+			continue
+		}
 		rn, rw := 0, 0
 		if e.pt >= 0 && e.pt < len(n.raveN) {
 			rn, rw = n.raveN[e.pt], n.raveW[e.pt]
@@ -335,14 +416,14 @@ func (n *node) choose(rng *rand.Rand, c, k float64) (int, *node) {
 // attach 把刚落下的局面接到当前节点上。
 // 指纹见过就返回原来的节点，fresh 为 false，调用方继续用那本账往下走。
 // 没见过才新建，fresh 为 true，这一盘的树在这里停住。
-func (n *node) attach(b *engine.Board, pt int, seen map[string]*node, s *engine.Scratch, rng *rand.Rand) (*node, bool) {
+func (n *node) attach(b *engine.Board, pt int, seen map[string]*node, s *engine.Scratch, rng *rand.Rand, settled []engine.Color) (*node, bool) {
 	key := positionKey(b)
 	if child, ok := seen[key]; ok {
 		n.edges = append(n.edges, edge{pt: pt, to: child})
 		return child, false
 	}
 	child := &node{}
-	child.ensure(b, s, rng)
+	child.ensure(b, s, rng, settled)
 	seen[key] = child
 	n.edges = append(n.edges, edge{pt: pt, to: child})
 	return child, true
@@ -361,6 +442,15 @@ func positionKey(b *engine.Board) string {
 	buf[b.N+2] = byte(ko >> 8)
 	buf[b.N+3] = byte(b.Passes)
 	return string(buf)
+}
+
+func (n *node) edgeTo(pt int) *node {
+	for _, e := range n.edges {
+		if pt < 0 && e.pt < 0 || e.pt == pt {
+			return e.to
+		}
+	}
+	return nil
 }
 
 func nodeOnPath(path []*node, n *node) bool {

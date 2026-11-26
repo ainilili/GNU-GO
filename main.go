@@ -74,8 +74,9 @@ type moveReq struct {
 type playReq struct {
 	Size    int       `json:"size"`    // 只接受 9。0 也当成 9
 	Komi    *float64  `json:"komi"`    // 缺省 7.5。用指针才能区分「没传」和「传了 0」
-	PerMove int       `json:"perMove"` // 每个候选的随机局数，只对 /api/think 有效。缺省 8
-	ThinkMS int       `json:"thinkMs"` // 思考时间上限，毫秒，只对 /api/think 有效
+	PerMove int       `json:"perMove"` // 每个候选的随机局数，只对 /api/think 有效。缺省 8。传了 level 时不用
+	Level   int       `json:"level"`   // 我方等级 1 到 10。每级 1000 盘，总盘数不再乘以合法点数
+	ThinkMS int       `json:"thinkMs"` // 思考时间上限，毫秒，只对 /api/think 有效。传了 level 时按等级放宽
 	Algo    string    `json:"algo"`    // "flat"、"tree" 或 "rave"。空字符串按 flat
 	Moves   []moveReq `json:"moves"`
 }
@@ -127,8 +128,8 @@ type stateView struct {
 	Board    [][]int    `json:"board"`          // 0 空，1 黑，2 白。board[y][x]
 	Captures [2]int     `json:"captures"`       // 下标 0 是黑提的子，1 是白提的子
 	Passes   int        `json:"passes"`         // 当前连续停手次数
-	Ended    bool       `json:"ended"`          // 连续停两次、同一方第二次停手，或轮到的一方没有可下的点
-	Resigned bool       `json:"resigned"`       // 同一方第二次停手。Winner 是对方
+	Ended    bool       `json:"ended"`          // 连续停两次、同一方第二次停手，或轮到的一方没有可下的点。终局都数子
+	Resigned bool       `json:"resigned"`       // 保留字段。停手收棋后改数子，不再把停手的一方判负
 	Legal    []point    `json:"legal"`          // 现在能落子的点。终局为空
 	Last     *point     `json:"last,omitempty"` // 最近一颗实子。连续停手时仍指向上一颗子
 	Score    *scoreView `json:"score,omitempty"`
@@ -145,34 +146,48 @@ func handleState(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleThink 重放之后，如果棋还没结束，就用平坦蒙特卡洛应一手，再把下完的局面返回。
-// 思考时间限制在 200 毫秒到 8 秒。每个候选的局数缺省 8，搜索内部再限制到最多 40。
+// 没传等级时，思考时间限制在 200 毫秒到 8 秒，每个候选缺省 8 盘。
+// 传了等级时，总盘数是等级乘 1000，思考时间按每级 20 秒放宽，最多 3 分钟。
 func handleThink(w http.ResponseWriter, r *http.Request) {
 	pos, err := decodeBoard(w, r)
 	if err != nil {
 		return
 	}
 	b := pos.board
-	if b.Over() || pos.resigned != 0 || len(legalPoints(b, engine.NewScratch(b.N))) == 0 {
+	if b.Over() || pos.stop || len(legalPoints(b, engine.NewScratch(b.N))) == 0 {
 		// 没有可下的点时直接数子，不停一手，也不再搜索。
 		writeJSON(w, http.StatusOK, makeState(pos, nil))
 		return
 	}
 	per := pos.req.PerMove
-	if per <= 0 {
-		per = 8
-	}
+	sims := 0
 	ms := pos.req.ThinkMS
-	if ms <= 0 {
-		ms = 2000
-	}
-	if ms < 200 {
-		ms = 200
-	}
-	if ms > 8000 {
-		ms = 8000
+	if pos.req.Level > 0 {
+		level := pos.req.Level
+		if level > 10 {
+			level = 10
+		}
+		sims = level * 1000
+		ms = level * 20000
+		if ms > 180000 {
+			ms = 180000
+		}
+	} else {
+		if per <= 0 {
+			per = 8
+		}
+		if ms <= 0 {
+			ms = 2000
+		}
+		if ms < 200 {
+			ms = 200
+		}
+		if ms > 8000 {
+			ms = 8000
+		}
 	}
 	mover := b.Side
-	res, err := runSearch(b, pos.req.Algo, per, time.Duration(ms)*time.Millisecond)
+	res, err := runSearch(b, pos.req.Algo, per, sims, time.Duration(ms)*time.Millisecond)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "算法只能是 flat、tree 或 rave")
 		return
@@ -198,12 +213,7 @@ func handleThink(w http.ResponseWriter, r *http.Request) {
 		an.Pass = true
 		an.Move = nil
 		played = pos.last // 停一手没有新的最后落子点，标记仍留在上一颗子上
-		pos.passN[mover]++
-		// 双方各停一次是正常终局，上面的 Play 已经把 Passes 加成 2。
-		// 同一方第二次停手，中间对手还在下，判这一方负。
-		if !b.Over() && pos.passN[mover] >= 2 {
-			pos.resigned = mover
-		}
+		notePass(&pos, mover)
 	}
 	pos.last = played
 	log.Printf("%s %s games=%d rounds=%d ms=%d wr=%.3f", res.algo, mover.Letter(), an.Games, an.Rounds, an.Millis, an.WinRate)
@@ -232,24 +242,24 @@ type moveStat struct {
 }
 
 // runSearch 按名字调用算法。空字符串就是平坦蒙特卡洛。
-func runSearch(b *engine.Board, algo string, per int, think time.Duration) (scored, error) {
+func runSearch(b *engine.Board, algo string, per, sims int, think time.Duration) (scored, error) {
 	switch algo {
 	case "", "flat":
-		res := flat.Search(b, flat.Config{PerMove: per, Think: think})
+		res := flat.Search(b, flat.Config{PerMove: per, Sims: sims, Think: think})
 		out := scored{algo: "flat", pass: res.Pass, pt: res.Pt, games: res.Games, winRate: res.WinRate, elapsed: res.Elapsed, rounds: res.Rounds}
 		for _, m := range res.Moves {
 			out.moves = append(out.moves, moveStat{pt: m.Pt, games: m.Games, wins: m.Wins, winRate: m.WinRate})
 		}
 		return out, nil
 	case "tree":
-		res := tree.Search(b, tree.Config{PerMove: per, Think: think})
+		res := tree.Search(b, tree.Config{PerMove: per, Sims: sims, Think: think})
 		out := scored{algo: "tree", pass: res.Pass, pt: res.Pt, games: res.Games, winRate: res.WinRate, elapsed: res.Elapsed, rounds: res.Rounds}
 		for _, m := range res.Moves {
 			out.moves = append(out.moves, moveStat{pt: m.Pt, games: m.Games, wins: m.Wins, winRate: m.WinRate})
 		}
 		return out, nil
 	case "rave":
-		res := rave.Search(b, rave.Config{PerMove: per, Think: think})
+		res := rave.Search(b, rave.Config{PerMove: per, Sims: sims, Think: think})
 		out := scored{algo: "rave", pass: res.Pass, pt: res.Pt, games: res.Games, winRate: res.WinRate, elapsed: res.Elapsed, rounds: res.Rounds}
 		for _, m := range res.Moves {
 			out.moves = append(out.moves, moveStat{pt: m.Pt, games: m.Games, wins: m.Wins, winRate: m.WinRate, raveN: m.RaveN, rave: m.Rave})
@@ -286,18 +296,27 @@ func toAnalysis(b *engine.Board, res scored) analysis {
 	return an
 }
 
-// position 是重放完的局面。resigned 非 0 表示这一方已经第二次停手。
+// position 是重放完的局面。stop 表示同一方已经第二次停手，对局结束，接下来数子。
 type position struct {
-	req      playReq
-	board    *engine.Board
-	last     *point
-	passN    [3]int
-	resigned engine.Color
+	req   playReq
+	board *engine.Board
+	last  *point
+	passN [3]int
+	stop  bool
+}
+
+// notePass 记下这一方主动停手。双方连续各停一次时，Play 已经把连续次数加成 2。
+// 中间对手下过子、同一方再停一次，连续次数不到 2，这里照样收棋，胜负交给数子。
+func notePass(pos *position, side engine.Color) {
+	pos.passN[side]++
+	if !pos.board.Over() && pos.passN[side] >= 2 {
+		pos.stop = true
+	}
 }
 
 // decodeBoard 读请求，从空棋盘重放全部着手。
 // 出错时已经写了 HTTP 错误，调用方看到 err != nil 就直接返回。
-// 同一方第二次停手后不再重放后面的着手。
+// 同一方第二次停手后对局已经结束，不再重放后面的着手。
 func decodeBoard(w http.ResponseWriter, r *http.Request) (position, error) {
 	var req playReq
 	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
@@ -334,7 +353,7 @@ func decodeBoard(w http.ResponseWriter, r *http.Request) (position, error) {
 	b := pos.board
 	s := engine.NewScratch(b.N)
 	for i, m := range req.Moves {
-		if b.Over() || pos.resigned != 0 {
+		if b.Over() || pos.stop {
 			break
 		}
 		pt := -1
@@ -353,10 +372,7 @@ func decodeBoard(w http.ResponseWriter, r *http.Request) (position, error) {
 			return position{}, err
 		}
 		if m.Pass {
-			pos.passN[side]++
-			if !b.Over() && pos.passN[side] >= 2 {
-				pos.resigned = side
-			}
+			notePass(&pos, side)
 		} else {
 			pos.last = &point{X: m.X, Y: m.Y}
 		}
@@ -365,7 +381,7 @@ func decodeBoard(w http.ResponseWriter, r *http.Request) (position, error) {
 }
 
 // makeState 把棋盘收成响应。终局才数子，并且不再列合法点。an 为 nil 表示这次没有搜索。
-// 同一方第二次停手时不数子，直接判这一方负。
+// 连续停两次、同一方第二次停手，都用中国规则数子定输赢。
 // 轮到的一方没有任何可下的点时，也不停一手，当场数子定输赢。
 func makeState(pos position, an *analysis) stateView {
 	b := pos.board
@@ -376,18 +392,12 @@ func makeState(pos position, an *analysis) stateView {
 		Board:    grid(b),
 		Captures: [2]int{b.Captures[engine.Black], b.Captures[engine.White]},
 		Passes:   b.Passes,
-		Ended:    b.Over() || pos.resigned != 0,
-		Resigned: pos.resigned != 0,
+		Ended:    b.Over() || pos.stop,
 		Legal:    []point{},
 		Last:     pos.last,
 		Analysis: an,
 	}
 	s := engine.NewScratch(b.N)
-	if pos.resigned != 0 {
-		st.Score = &scoreView{Winner: engine.Opponent(pos.resigned).Letter(), Komi: b.Komi}
-		st.ToMove = ""
-		return st
-	}
 	if st.Ended {
 		st.Score = scoreOf(b, s)
 		st.ToMove = ""

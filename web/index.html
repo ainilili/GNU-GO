@@ -57,7 +57,8 @@
     }
     button.on { background: var(--ink); color: #fff; border-color: var(--ink); }
     button:disabled { opacity: 0.45; cursor: default; }
-    label.slider { display: block; color: var(--muted); margin: 8px 0; }
+    label.slider { display: block; color: var(--muted); margin: 12px 0; }
+    label.slider input[type="range"] { display: block; width: 100%; margin: 6px 0 0; }
     ol { margin: 0; padding-left: 1.2em; }
     li { margin: 2px 0; }
     li.pick { color: var(--good); font-weight: 600; }
@@ -98,11 +99,15 @@
         <button type="button" data-opponent="human" class="on">我来下</button>
         <button type="button" data-opponent="gnugo">对 GNU Go</button>
       </div>
-      <p class="note" id="opponentNote" hidden>选中的算法执上面的颜色，对方是 GNU Go 的 9 路引擎，等级 10，贴 7.5。终局仍用这边的中国规则数子。</p>
-      <label class="slider"><span id="perLabel">每个候选的随机局数</span> <output id="perOut">8</output>
-        <input id="per" type="range" min="1" max="12" value="8">
+      <p class="note" id="opponentNote" hidden>选中的算法执上面的颜色，对方是 GNU Go 的 9 路引擎，贴 7.5。终局仍用这边的中国规则数子。选好等级后按开始。</p>
+      <label class="slider" id="ownLevelLabel">我方等级 <output id="ownLevelOut">1</output>，大约每手 <output id="ownLevelSims">1000</output> 盘
+        <input id="ownLevel" type="range" min="1" max="10" value="1">
+      </label>
+      <label class="slider" id="levelLabel" hidden>GNU Go 等级 <output id="levelOut">10</output>，大约每手 <output id="levelSims">10000</output> 盘
+        <input id="level" type="range" min="1" max="10" value="10">
       </label>
       <div class="row">
+        <button type="button" id="start" hidden>开始</button>
         <button type="button" id="pass">停一手</button>
         <button type="button" id="undo">悔棋</button>
         <button type="button" id="new">新对局</button>
@@ -125,8 +130,13 @@
     const capsEl = document.getElementById("caps");
     const searchEl = document.getElementById("search");
     const rowsEl = document.getElementById("rows");
-    const perInput = document.getElementById("per");
-    const perOut = document.getElementById("perOut");
+    const ownLevelInput = document.getElementById("ownLevel");
+    const ownLevelOut = document.getElementById("ownLevelOut");
+    const ownLevelSims = document.getElementById("ownLevelSims");
+    const levelInput = document.getElementById("level");
+    const levelOut = document.getElementById("levelOut");
+    const levelSims = document.getElementById("levelSims");
+    const startBtn = document.getElementById("start");
 
     let moves = [];
     let state = null;
@@ -144,7 +154,6 @@
         eyebrow: "第 1 步",
         title: "平坦蒙特卡洛",
         blurb: "每个合法点单独下完若干盘随机棋。胜率最高的点落下。",
-        per: "每个候选的随机局数",
         ledger: "按胜率选。第一行就是落下的那手。",
         lesson: "<p>每个合法点各自从根局面下完若干盘。这一手是指定的，后面双方均匀随机下到终局。</p><p>没有树。下完的局面丢掉，下一盘还是从根上的每一个点重新开始。</p><p>胜率最高的点落下。盘数一样时，胜的局更多的优先。</p>"
       },
@@ -152,7 +161,6 @@
         eyebrow: "第 2 步",
         title: "搜索树",
         blurb: "下过的局面留下来。每盘只新展开一个点。最后下访问次数最多的点。",
-        per: "每个候选大约几盘",
         ledger: "按访问次数选，不是按胜率。第一行就是落下的那手。",
         lesson: "<p>每一盘从根出发。这个局面还有没试过的合法点，就只展开一个，然后随机下完。</p><p>合法点都已经在树上，就走进胜率最高的那个子节点，下一盘可以从这里接着走。</p><p>胜负写回整条路径。最后比较访问次数。次数相同再看胜率。</p><p>随机终局和平坦蒙特卡洛一样。没有 UCT，没有 RAVE。</p>"
       },
@@ -160,7 +168,6 @@
         eyebrow: "第 3 步",
         title: "UCT+RAVE",
         blurb: "选点用 UCT 和 RAVE。随机终局不再均匀抽点，按一张 3×3 棋形表加权。",
-        per: "大约每个候选几盘",
         ledger: "按访问次数选。UCT 让少下过的点还被看到。RAVE 是同一点在后手的胜率。",
         lesson: "<p>已展开的子节点和还没试过的点放在一起比。每一盘最多新展开一个点，然后按棋形下完。不同次序落到同一盘棋时，共用这一盘的胜负。</p><p>分数先把 RAVE 混进胜率：(1-β)Q + β Q<sub>AMAF</sub>。β = sqrt(k/(3n+k))，k = 1000。再加 UCT：c * sqrt(ln(N+1)/(n+1))，c = 0.1。最后仍下访问次数最多的点。</p><p>终局用 GNU Go 的 3×3 棋形表抽样。能提子、能逃打吃的权重大，真眼权重是 0。对不上的点权重是 1。</p>"
       }
@@ -170,13 +177,37 @@
       document.getElementById("eyebrow").textContent = text.eyebrow;
       document.getElementById("title").textContent = text.title;
       document.getElementById("blurb").textContent = text.blurb;
-      document.getElementById("perLabel").textContent = text.per;
-      document.getElementById("lesson").innerHTML = text.lesson + "<p>终局用中国规则数子，贴 7.5 目。轮到的一方没有可下的点，当场数子定输赢，不停一手。双方各停一次也会收棋。同一方第二次主动停手，直接判负。上面的算法可以随时换，下一手电脑用新的。</p>";
+      document.getElementById("lesson").innerHTML = text.lesson + "<p>终局用中国规则数子，贴 7.5 目。轮到的一方没有可下的点，当场数子定输赢，不停一手。双方各停一次也会收棋。同一方第二次主动停手同样收棋，按中国规则数子。我方等级和 GNU Go 一样，每级大约 1000 盘。上面的算法可以随时换，下一手电脑用新的。</p>";
       const shown = (state && state.analysis && state.analysis.algo) || algo;
       document.getElementById("ledger").textContent = algoText[shown].ledger;
     }
 
-    perInput.addEventListener("input", () => { perOut.textContent = perInput.value; });
+    function updateOwnLevel() {
+      const level = Number(ownLevelInput.value);
+      ownLevelOut.textContent = String(level);
+      ownLevelSims.textContent = String(level * 1000);
+    }
+    ownLevelInput.addEventListener("input", updateOwnLevel);
+    // GNU Go 9 路每升 1 级大约多 1000 盘。页面只改等级，盘数跟着显示。
+    function updateLevel() {
+      const level = Number(levelInput.value);
+      levelOut.textContent = String(level);
+      levelSims.textContent = String(level * 1000);
+    }
+    levelInput.addEventListener("input", updateLevel);
+    function syncOpponent() {
+      const gnugo = opponent === "gnugo";
+      document.getElementById("opponentNote").hidden = !gnugo;
+      document.getElementById("levelLabel").hidden = !gnugo;
+      startBtn.hidden = !gnugo;
+      document.getElementById("pass").disabled = gnugo;
+      updateStart();
+    }
+    function updateStart() {
+      const waiting = opponent === "gnugo" && !busy && state && !state.ended && !gnugoResigned;
+      startBtn.disabled = !waiting;
+      startBtn.classList.toggle("on", waiting);
+    }
     document.getElementById("algos").addEventListener("click", (ev) => {
       const btn = ev.target.closest("button");
       if (!btn || busy) return;
@@ -189,27 +220,24 @@
       if (!btn || busy) return;
       opponent = btn.dataset.opponent;
       for (const b of ev.currentTarget.querySelectorAll("button")) b.classList.toggle("on", b === btn);
-      document.getElementById("opponentNote").hidden = opponent !== "gnugo";
-      document.getElementById("pass").disabled = opponent === "gnugo";
-      if (opponent === "gnugo" && state && !state.ended) runMatch();
+      syncOpponent();
+      if (state && !state.ended && !gnugoResigned) statusEl.textContent = opponent === "gnugo" ? "按开始对局" : outcomeText();
     });
     document.getElementById("colors").addEventListener("click", (ev) => {
       const btn = ev.target.closest("button");
       if (!btn || busy || !state || moves.length) return;
       human = btn.dataset.color;
       for (const b of ev.currentTarget.querySelectorAll("button")) b.classList.toggle("on", b === btn);
-      if (opponent === "gnugo") runMatch();
-      else if (human === "W") think();
+      if (opponent === "human" && human === "W") think();
     });
     document.getElementById("pass").onclick = () => { if (opponent === "human") play({ pass: true }); };
     document.getElementById("undo").onclick = () => {
       if (busy || !moves.length) return;
-      // 人机对局退到人可以下的局面。对 GNU Go 只退一手，然后双方接着下。
+      // 人机对局退到人可以下的局面。对 GNU Go 只退一手，要再按开始才继续。
       moves.pop();
       if (opponent === "human" && moves.length && sideToMove() !== human) moves.pop();
       gnugoResigned = false;
-      refresh().then(() => { if (opponent === "gnugo" && state && !state.ended) runMatch(); })
-        .catch((err) => { statusEl.textContent = err.message; });
+      refresh().catch((err) => { statusEl.textContent = err.message; });
     };
     document.getElementById("new").onclick = () => {
       if (busy) {
@@ -219,6 +247,7 @@
       }
       startNew();
     };
+    startBtn.onclick = () => { runMatch(); };
     canvas.addEventListener("click", (ev) => {
       if (opponent === "gnugo" || busy || !state || state.ended || sideToMove() !== human) return;
       const rect = canvas.getBoundingClientRect();
@@ -261,7 +290,7 @@
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ size: 9, algo, perMove: Number(perInput.value), thinkMs: 3000, moves, ...extra }),
+        body: JSON.stringify({ size: 9, algo, level: Number(ownLevelInput.value), moves, ...extra }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "请求失败");
@@ -271,20 +300,17 @@
     async function refresh() {
       state = await post("/api/state");
       paint();
-      statusEl.textContent = outcomeText();
+      statusEl.textContent = opponent === "gnugo" && !busy && !state.ended && !gnugoResigned ? "按开始对局" : outcomeText();
       capsEl.textContent = "黑 " + state.captures[0] + " · 白 " + state.captures[1];
       showAlgo();
+      updateStart();
       if (!state.analysis) {
         searchEl.textContent = "还没搜索";
         fillTable(null);
       }
     }
-    // outcomeText 写当前该谁下，或者终局结果。同一方第二次停手单独写判负。
+    // outcomeText 写当前该谁下，或者终局的数子结果。
     function outcomeText() {
-      if (state.resigned && state.score) {
-        const loser = state.score.winner === "B" ? "白棋" : "黑棋";
-        return loser + "再次停手，判负";
-      }
       const who = state.ended ? "终局" : (state.toMove === "B" ? "黑走" : "白走");
       if (state.score) {
         const w = state.score.winner === "B" ? "黑胜" : state.score.winner === "W" ? "白胜" : "和";
@@ -304,8 +330,7 @@
       gnugoResigned = false;
       moves = [];
       refresh().then(() => {
-        if (opponent === "gnugo") runMatch();
-        else if (human === "W") think();
+        if (opponent === "human" && human === "W") think();
       }).catch((err) => { statusEl.textContent = err.message; });
     }
     // think 请求这边的算法落子。响应里的棋盘已经包含这手，这里再把同一手补进 moves。
@@ -321,7 +346,7 @@
       }
     }
     async function thinkMove() {
-      statusEl.textContent = "每个候选各下 " + perInput.value + " 盘随机棋…";
+      statusEl.textContent = "我方等级 " + ownLevelInput.value + "，大约下 " + (Number(ownLevelInput.value) * 1000) + " 盘…";
       state = await post("/api/think");
       const played = state.analysis;
       if (played && played.pass) moves.push({ pass: true });
@@ -365,7 +390,7 @@
       statusEl.textContent = "GNU Go 思考…";
       await go.boardsize(9);
       await go.komi(7.5);
-      await go.level(10);
+      await go.level(Number(levelInput.value));
       let color = "black";
       for (const m of moves) {
         await go.play(color, m.pass ? "pass" : label(m.x, m.y));
@@ -393,6 +418,7 @@
       if (busy || opponent !== "gnugo" || !state || state.ended) return;
       busy = true;
       stopMatch = false;
+      updateStart();
       try {
         while (opponent === "gnugo" && state && !state.ended && !gnugoResigned && !stopMatch) {
           if (sideToMove() === human) await thinkMove();
@@ -402,6 +428,7 @@
         statusEl.textContent = err.message;
       } finally {
         busy = false;
+        updateStart();
         if (stopMatch) startNew();
       }
     }
@@ -497,6 +524,9 @@
       }
     }
     showAlgo();
+    updateOwnLevel();
+    updateLevel();
+    syncOpponent();
     refresh().catch((err) => { statusEl.textContent = err.message; });
   </script>
 </body>

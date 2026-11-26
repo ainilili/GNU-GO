@@ -136,9 +136,10 @@ func TestNoLegalMoveScoresImmediately(t *testing.T) {
 	}
 }
 
-// TestSecondPassResigns 确认同一方第二次停手判负，不再继续。
-func TestSecondPassResigns(t *testing.T) {
-	body := `{"size":9,"moves":[{"x":0,"y":0},{"pass":true},{"x":1,"y":0},{"pass":true}]}`
+// TestSecondPassScores 确认同一方第二次停手收棋并数子。
+// 白棋是第二次停手的一方，贴目之后白领先，不能再把白棋判负。
+func TestSecondPassScores(t *testing.T) {
+	body := `{"size":9,"moves":[{"x":0,"y":0},{"x":8,"y":8},{"x":1,"y":0},{"pass":true},{"x":1,"y":1},{"pass":true}]}`
 	req := httptest.NewRequest(http.MethodPost, "/api/state", bytes.NewBufferString(body))
 	rr := httptest.NewRecorder()
 	newMux().ServeHTTP(rr, req)
@@ -149,8 +150,8 @@ func TestSecondPassResigns(t *testing.T) {
 	if err := json.Unmarshal(rr.Body.Bytes(), &st); err != nil {
 		t.Fatal(err)
 	}
-	if !st.Ended || !st.Resigned || st.Score == nil || st.Score.Winner != "B" || st.ToMove != "" {
-		t.Fatalf("%+v", st)
+	if !st.Ended || st.Resigned || st.Score == nil || st.Score.Winner != "W" || st.Score.Margin != 5.5 || st.ToMove != "" || len(st.Legal) != 0 {
+		t.Fatalf("%+v score=%+v", st, st.Score)
 	}
 }
 

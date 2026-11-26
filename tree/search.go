@@ -17,6 +17,7 @@ import (
 // 这样页面上同一个数字，两种算法花费的随机终局数量大致相同。
 type Config struct {
 	PerMove int
+	Sims    int // 大于 0 时是总盘数，不再乘以合法点数
 	Think   time.Duration
 	Seed    int64
 }
@@ -59,8 +60,12 @@ func (c Config) normalized() Config {
 	if c.Think <= 0 {
 		c.Think = 2 * time.Second
 	}
-	if c.Think > 8*time.Second {
-		c.Think = 8 * time.Second
+	limit := 8 * time.Second
+	if c.Sims > 0 {
+		limit = 3 * time.Minute
+	}
+	if c.Think > limit {
+		c.Think = limit
 	}
 	return c
 }
@@ -91,6 +96,9 @@ func Search(root *engine.Board, cfg Config) Result {
 	// 总盘数对齐平坦蒙特卡洛：每个候选大约 PerMove 盘。
 	// 第一批把根上每个合法点都展开一次，即使已经超时也要做完。
 	budget := cfg.PerMove * len(legal)
+	if cfg.Sims > 0 {
+		budget = cfg.Sims
+	}
 	deadline := start.Add(cfg.Think)
 	sims := 0
 	for sims < budget {
